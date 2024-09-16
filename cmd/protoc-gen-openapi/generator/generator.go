@@ -239,13 +239,9 @@ func (g *OpenAPIv3Generator) buildDocumentV3() *v3.Document {
 	return d
 }
 
-// filterCommentString removes line breaks and linter rules from comments.
-func (g *OpenAPIv3Generator) filterCommentString(c protogen.Comments, removeNewLines bool) string {
-	comment := string(c)
-	if removeNewLines {
-		comment = strings.Replace(comment, "\n", "", -1)
-	}
-	comment = g.linterRulePattern.ReplaceAllString(comment, "")
+// filterCommentString removes linter rules from comments.
+func (g *OpenAPIv3Generator) filterCommentString(c protogen.Comments) string {
+	comment := g.linterRulePattern.ReplaceAllString(string(c), "")
 	return strings.TrimSpace(comment)
 }
 
@@ -273,6 +269,9 @@ func (g *OpenAPIv3Generator) findAndFormatFieldName(name string, inMessage *prot
 // In the case of a repeated type, the parameter can be repeated in the URL as ...?param=A&param=B.
 // In the case of a message type, each field of the message is mapped to a separate parameter,
 // such as ...?foo.a=A&foo.b=B&foo.c=C.
+// There are exceptions:
+// - for wrapper types it will use the same representation as the wrapped primitive type in JSON
+// - for google.protobuf.timestamp type it will be serialized as a string
 //
 // maps, Struct and Empty can NOT be used
 // messages can have any number of sub messages - including circular (e.g. sub.subsub.sub.subsub.id)
@@ -288,7 +287,7 @@ func (g *OpenAPIv3Generator) _buildQueryParamsV3(field *protogen.Field, depths m
 	parameters := []*v3.ParameterOrReference{}
 
 	queryFieldName := g.reflect.formatFieldName(field.Desc)
-	fieldDescription := g.filterCommentString(field.Comments.Leading, true)
+	fieldDescription := g.filterCommentString(field.Comments.Leading)
 
 	if field.Desc.IsMap() {
 		// Map types are not allowed in query parameteres
@@ -297,7 +296,8 @@ func (g *OpenAPIv3Generator) _buildQueryParamsV3(field *protogen.Field, depths m
 	} else if field.Desc.Kind() == protoreflect.MessageKind {
 		typeName := g.reflect.fullMessageTypeName(field.Desc.Message())
 
-		if typeName == ".google.protobuf.Value" {
+		switch typeName {
+		case ".google.protobuf.Value":
 			fieldSchema := g.reflect.schemaOrReferenceForField(field.Desc)
 			parameters = append(parameters,
 				&v3.ParameterOrReference{
@@ -312,7 +312,44 @@ func (g *OpenAPIv3Generator) _buildQueryParamsV3(field *protogen.Field, depths m
 					},
 				})
 			return parameters
-		} else if field.Desc.IsList() {
+
+		case ".google.protobuf.BoolValue", ".google.protobuf.BytesValue", ".google.protobuf.Int32Value", ".google.protobuf.UInt32Value",
+			".google.protobuf.StringValue", ".google.protobuf.Int64Value", ".google.protobuf.UInt64Value", ".google.protobuf.FloatValue",
+			".google.protobuf.DoubleValue":
+			valueField := getValueField(field.Message.Desc)
+			fieldSchema := g.reflect.schemaOrReferenceForField(valueField)
+			parameters = append(parameters,
+				&v3.ParameterOrReference{
+					Oneof: &v3.ParameterOrReference_Parameter{
+						Parameter: &v3.Parameter{
+							Name:        queryFieldName,
+							In:          "query",
+							Description: fieldDescription,
+							Required:    false,
+							Schema:      fieldSchema,
+						},
+					},
+				})
+			return parameters
+
+		case ".google.protobuf.Timestamp":
+			fieldSchema := g.reflect.schemaOrReferenceForMessage(field.Message.Desc)
+			parameters = append(parameters,
+				&v3.ParameterOrReference{
+					Oneof: &v3.ParameterOrReference_Parameter{
+						Parameter: &v3.Parameter{
+							Name:        queryFieldName,
+							In:          "query",
+							Description: fieldDescription,
+							Required:    false,
+							Schema:      fieldSchema,
+						},
+					},
+				})
+			return parameters
+		}
+
+		if field.Desc.IsList() {
 			// Only non-repeated message types are valid
 			return parameters
 		}
@@ -412,7 +449,7 @@ func (g *OpenAPIv3Generator) buildOperationV3(
 			field := g.findField(pathParameter, inputMessage)
 			if field != nil {
 				fieldSchema = g.reflect.schemaOrReferenceForField(field.Desc)
-				fieldDescription = g.filterCommentString(field.Comments.Leading, true)
+				fieldDescription = g.filterCommentString(field.Comments.Leading)
 			} else {
 				// If field does not exist, it is safe to set it to string, as it is ignored downstream
 				fieldSchema = &v3.SchemaOrReference{
@@ -647,20 +684,27 @@ func (g *OpenAPIv3Generator) addPathsToDocumentV3(d *v3.Document, services []*pr
 		annotationsCount := 0
 
 		for _, method := range service.Methods {
-			comment := g.filterCommentString(method.Comments.Leading, false)
+			comment := g.filterCommentString(method.Comments.Leading)
 			inputMessage := method.Input
 			outputMessage := method.Output
 			operationID := service.GoName + "_" + method.GoName
 
-			var path string
-			var methodName string
-			var body string
+			rules := make([]*annotations.HttpRule, 0)
 
 			extHTTP := proto.GetExtension(method.Desc.Options(), annotations.E_Http)
 			if extHTTP != nil && extHTTP != annotations.E_Http.InterfaceOf(annotations.E_Http.Zero()) {
 				annotationsCount++
 
 				rule := extHTTP.(*annotations.HttpRule)
+				rules = append(rules, rule)
+				rules = append(rules, rule.AdditionalBindings...)
+			}
+
+			for _, rule := range rules {
+				var path string
+				var methodName string
+				var body string
+
 				body = rule.Body
 				switch pattern := rule.Pattern.(type) {
 				case *annotations.HttpRule_Get:
@@ -683,26 +727,26 @@ func (g *OpenAPIv3Generator) addPathsToDocumentV3(d *v3.Document, services []*pr
 				default:
 					path = "unknown-unsupported"
 				}
-			}
 
-			if methodName != "" {
-				defaultHost := proto.GetExtension(service.Desc.Options(), annotations.E_DefaultHost).(string)
+				if methodName != "" {
+					defaultHost := proto.GetExtension(service.Desc.Options(), annotations.E_DefaultHost).(string)
 
-				op, path2 := g.buildOperationV3(
-					d, operationID, service.GoName, comment, defaultHost, path, body, inputMessage, outputMessage)
+					op, path2 := g.buildOperationV3(
+						d, operationID, service.GoName, comment, defaultHost, path, body, inputMessage, outputMessage)
 
-				// Merge any `Operation` annotations with the current
-				extOperation := proto.GetExtension(method.Desc.Options(), v3.E_Operation)
-				if extOperation != nil {
-					proto.Merge(op, extOperation.(*v3.Operation))
+					// Merge any `Operation` annotations with the current
+					extOperation := proto.GetExtension(method.Desc.Options(), v3.E_Operation)
+					if extOperation != nil {
+						proto.Merge(op, extOperation.(*v3.Operation))
+					}
+
+					g.addOperationToDocumentV3(d, op, path2, methodName)
 				}
-
-				g.addOperationToDocumentV3(d, op, path2, methodName)
 			}
 		}
 
 		if annotationsCount > 0 {
-			comment := g.filterCommentString(service.Comments.Leading, false)
+			comment := g.filterCommentString(service.Comments.Leading)
 			d.Tags = append(d.Tags, &v3.Tag{Name: service.GoName, Description: comment})
 		}
 	}
@@ -734,7 +778,7 @@ func (g *OpenAPIv3Generator) addSchemasForMessagesToDocumentV3(d *v3.Document, m
 		}
 
 		typeName := g.reflect.fullMessageTypeName(message.Desc)
-		messageDescription := g.filterCommentString(message.Comments.Leading, true)
+		messageDescription := g.filterCommentString(message.Comments.Leading)
 
 		// `google.protobuf.Value` and `google.protobuf.Any` have special JSON transcoding
 		// so we can't just reflect on the message descriptor.
@@ -759,7 +803,7 @@ func (g *OpenAPIv3Generator) addSchemasForMessagesToDocumentV3(d *v3.Document, m
 		var required []string
 		for _, field := range message.Fields {
 			// Get the field description from the comments.
-			description := g.filterCommentString(field.Comments.Leading, true)
+			description := g.filterCommentString(field.Comments.Leading)
 			// Check the field annotations to see if this is a readonly or writeonly field.
 			inputOnly := false
 			outputOnly := false
